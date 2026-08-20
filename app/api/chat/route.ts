@@ -1,309 +1,184 @@
-import { NextResponse } from "next/server";
-import OpenAI from "openai";
-import { GoogleGenAI } from "@google/genai";
-
-type ChatRole = "user" | "assistant";
-
-type ChatEntry = {
-  role: ChatRole;
-  content: string;
-};
-
-type RequestPayload = {
-  message?: string;
-  history?: ChatEntry[];
-  persona?: string;
-  mode?: string;
-  taskMode?: string;
-  systemPrompt?: string;
-  useMemory?: boolean;
-  memory?: string;
-  attachments?: Array<{
-    name: string;
-    type: string;
-    size: string;
-  }>;
-  kind?: string;
-  imagePrompt?: string;
-  imageStyle?: string;
-  model?: string;
-  stream?: boolean;
-};
-
-const SYSTEM_PROMPT =
-  "You are ZeroGen, a helpful, practical, intelligent AI assistant.";
-
-function buildPrompt(payload: RequestPayload) {
-  const history = (payload.history ?? []).slice(-10);
-
-  const conversation = history
-    .map(
-      (entry) =>
-        `${entry.role === "assistant" ? "Assistant" : "User"}: ${entry.content}`
-    )
-    .join("\n");
-
-  return [
-    payload.systemPrompt || SYSTEM_PROMPT,
-    `Persona: ${payload.persona || "helper"}`,
-    `Mode: ${payload.mode || "fast"}`,
-    `Task: ${payload.taskMode || "default"}`,
-    payload.useMemory && payload.memory
-      ? `Memory: ${payload.memory}`
-      : "Memory: none",
-    conversation
-      ? `Conversation:\n${conversation}`
-      : "Conversation: none",
-    payload.attachments?.length
-      ? `Attachments:\n${payload.attachments
-          .map(
-            (file) =>
-              `- ${file.name} (${file.type}, ${file.size})`
-          )
-          .join("\n")}`
-      : "Attachments: none",
-    `Latest user message: ${payload.message || ""}`,
-  ].join("\n\n");
-}
-
-function localReply(payload: RequestPayload) {
-  const message = (payload.message || "").trim();
-
-  if (!message) {
-    return "Please enter a message and I'll help you.";
-  }
-
-  const lower = message.toLowerCase();
-
-  if (
-    lower === "hi" ||
-    lower === "hello" ||
-    lower === "hey" ||
-    lower.startsWith("hi ")
-  ) {
-    return "Hello! I'm ZeroGen. How can I help you?";
-  }
-
-  if (lower.includes("your name")) {
-    return "I'm ZeroGen, your AI assistant.";
-  }
-
-  return `I'm ZeroGen. I received your message: "${message}"\n\nConnect an OpenAI or Gemini API key to enable full AI responses.`;
-}
-
-function hasOpenAIKey() {
-  const key = process.env.OPENAI_API_KEY?.trim();
-
-  if (!key) return false;
-
-  const invalidValues = [
-    "replace_with_real_openai_key",
-    "replace_with_openai_key",
-    "your_openai_api_key",
-    "your-api-key",
-  ];
-
-  return !invalidValues.includes(key.toLowerCase());
-}
-
-function hasGeminiKey() {
-  return Boolean(
-    process.env.GOOGLE_API_KEY?.trim() ||
-      process.env.GEMINI_API_KEY?.trim()
-  );
-}
-
-async function generateWithOpenAI(payload: RequestPayload) {
-  if (!hasOpenAIKey()) {
-    return null;
-  }
-
-  const client = new OpenAI({
-    apiKey: process.env.OPENAI_API_KEY,
-  });
-
-  const model =
-    process.env.OPENAI_MODEL?.trim() ||
-    payload.model ||
-    "gpt-4o-mini";
-
-  const completion = await client.chat.completions.create({
-    model,
-    messages: [
-      {
-        role: "system",
-        content: payload.systemPrompt || SYSTEM_PROMPT,
-      },
-      {
-        role: "user",
-        content: buildPrompt(payload),
-      },
-    ],
-    temperature: 0.7,
-    max_tokens: 1200,
-  });
-
-  return completion.choices?.[0]?.message?.content?.trim() || null;
-}
-
-async function generateWithGemini(payload: RequestPayload) {
-  if (!hasGeminiKey()) {
-    return null;
-  }
-
-  const apiKey =
-    process.env.GOOGLE_API_KEY?.trim() ||
-    process.env.GEMINI_API_KEY?.trim();
-
-  if (!apiKey) {
-    return null;
-  }
-
-  const client = new GoogleGenAI({
-    apiKey,
-  });
-
-  const model =
-    process.env.GEMINI_MODEL?.trim() ||
-    "gemini-2.0-flash";
-
-  const response = await client.models.generateContent({
-    model,
-    contents: buildPrompt(payload),
-  });
-
-  return response.text?.trim() || null;
-}
+import { getCurrentUser, unauthorizedResponse } from "@/lib/session";
+import {
+  verifyConversation,
+  getRecentMessageHistory,
+  addMessage,
+  touchConversation,
+  updateUserSettings,
+} from "@/lib/db";
+import { buildSystemPrompt } from "@/lib/system-prompt";
+import { createChatStream, formatAIError, MessagePayload } from "@/lib/ai";
+import { generateConversationTitle } from "@/lib/title-generator";
 
 export async function POST(request: Request) {
   try {
-    const contentType = request.headers.get("content-type") || "";
-
-    if (!contentType.includes("application/json")) {
-      return NextResponse.json(
-        {
-          error: "Request must use application/json.",
-        },
-        { status: 400 }
-      );
+    const user = await getCurrentUser();
+    if (!user) {
+      return unauthorizedResponse("You must be logged in to send messages.");
     }
 
-    let payload: RequestPayload;
-
-    try {
-      payload = (await request.json()) as RequestPayload;
-    } catch {
-      return NextResponse.json(
-        {
-          error: "Invalid JSON request body.",
-        },
-        { status: 400 }
-      );
-    }
-
-    if (!payload.message?.trim() && payload.kind !== "image") {
-      return NextResponse.json(
-        {
-          error: "Message is required.",
-        },
-        { status: 400 }
-      );
-    }
-
-    console.log("[api/chat] Request received");
-    console.log(
-      "[api/chat] OpenAI:",
-      hasOpenAIKey() ? "available" : "not configured"
-    );
-    console.log(
-      "[api/chat] Gemini:",
-      hasGeminiKey() ? "available" : "not configured"
-    );
-
-    /*
-     * Image requests currently return a safe placeholder response.
-     * This prevents the API route from failing while the real image
-     * generation provider is configured.
-     */
-    if (payload.kind === "image") {
-      return NextResponse.json({
-        reply:
-          payload.imagePrompt ||
-          "Image generation request received.",
-        provider: "local",
+    const body = await request.json().catch(() => null);
+    if (!body) {
+      return new Response(JSON.stringify({ error: "Invalid JSON request body." }), {
+        status: 400,
+        headers: { "Content-Type": "application/json" },
       });
     }
 
-    let reply: string | null = null;
-    let provider = "local";
+    const {
+      conversationId,
+      message,
+      model,
+      persona,
+      mode,
+      taskMode,
+      systemPrompt: customSystemPrompt,
+      useMemory,
+      memory,
+      attachments,
+      isRetry,
+    } = body;
 
-    /*
-     * Priority:
-     * 1. OpenAI
-     * 2. Gemini
-     * 3. Local fallback
-     */
-
-    if (hasOpenAIKey()) {
-      try {
-        reply = await generateWithOpenAI(payload);
-
-        if (reply) {
-          provider = "openai";
-        }
-      } catch (error) {
-        console.error(
-          "[api/chat] OpenAI failed:",
-          error instanceof Error
-            ? error.message
-            : error
-        );
-      }
+    if (!conversationId) {
+      return new Response(JSON.stringify({ error: "conversationId is required." }), {
+        status: 400,
+        headers: { "Content-Type": "application/json" },
+      });
     }
 
-    if (!reply && hasGeminiKey()) {
-      try {
-        reply = await generateWithGemini(payload);
-
-        if (reply) {
-          provider = "gemini";
-        }
-      } catch (error) {
-        console.error(
-          "[api/chat] Gemini failed:",
-          error instanceof Error
-            ? error.message
-            : error
-        );
-      }
+    // Fast indexed ownership check (<0.1ms)
+    const conversation = verifyConversation(conversationId, user.id);
+    if (!conversation) {
+      return new Response(JSON.stringify({ error: "Conversation not found or unauthorized." }), {
+        status: 404,
+        headers: { "Content-Type": "application/json" },
+      });
     }
 
-    if (!reply) {
-      reply = localReply(payload);
-      provider = "local";
+    const messageText = (message || "").trim();
+    if (!messageText && !isRetry && !attachments?.length) {
+      return new Response(JSON.stringify({ error: "Message or attachment is required." }), {
+        status: 400,
+        headers: { "Content-Type": "application/json" },
+      });
     }
 
-    console.log(
-      `[api/chat] Response generated using ${provider}`
-    );
+    // Load lean message history (<0.1ms)
+    const history: MessagePayload[] = getRecentMessageHistory(conversationId, user.id, 8);
 
-    return NextResponse.json({
-      reply,
-      provider,
+    // If new user message, persist and append to context
+    if (messageText && !isRetry) {
+      addMessage({
+        conversation_id: conversationId,
+        user_id: user.id,
+        role: "user",
+        content: messageText,
+        attachments_json: attachments?.length ? JSON.stringify(attachments) : undefined,
+        model,
+      });
+      history.push({ role: "user", content: messageText });
+    }
+
+    // Build system prompt (<0.1ms)
+    const systemPrompt = buildSystemPrompt({
+      persona,
+      taskMode,
+      aiMode: mode,
+      customInstructions: customSystemPrompt,
+      memoryContext: useMemory && memory ? memory : undefined,
     });
-  } catch (error) {
-    console.error(
-      "[api/chat] Unexpected error:",
-      error
-    );
 
-    return NextResponse.json(
-      {
-        error: "The ZeroGen API encountered an unexpected error.",
-        reply:
-          "Sorry, I couldn't generate a response right now.",
+    // Initiate stream directly to AI provider
+    const { stream: aiStream, modelUsed, fallbackUsed } = await createChatStream({
+      messages: history,
+      systemPrompt,
+      model,
+      attachments,
+      signal: request.signal,
+    });
+
+    // Stream accumulator & background persistence
+    let fullResponseText = "";
+    const decoder = new TextDecoder();
+
+    const transformStream = new TransformStream<Uint8Array, Uint8Array>({
+      transform(chunk, controller) {
+        const text = decoder.decode(chunk, { stream: true });
+        fullResponseText += text;
+        controller.enqueue(chunk);
       },
-      { status: 500 }
+      async flush() {
+        const trimmed = fullResponseText.trim();
+        if (trimmed) {
+          try {
+            // Persist assistant message in background
+            addMessage({
+              conversation_id: conversationId,
+              user_id: user.id,
+              role: "assistant",
+              content: trimmed,
+              model: modelUsed,
+            });
+
+            // Auto-generate professional conversation title
+            const isPlaceholderTitle =
+              !conversation.title ||
+              conversation.title === "New Chat" ||
+              conversation.title === "New Conversation" ||
+              conversation.title === "Welcome to ZeroGen" ||
+              conversation.title.startsWith("temp_");
+
+            if (isPlaceholderTitle && messageText) {
+              try {
+                const newTitle = await generateConversationTitle(messageText);
+                touchConversation(conversationId, user.id, newTitle);
+              } catch (titleErr) {
+                console.error("[api/chat] Title generation error:", titleErr);
+                touchConversation(conversationId, user.id);
+              }
+            } else {
+              touchConversation(conversationId, user.id);
+            }
+
+            // Update memory context if enabled
+            if (useMemory && messageText) {
+              const currentMemory = memory || "";
+              const newMemoryEntry = `User: ${messageText.slice(0, 100)}\nZeroGen: ${trimmed.slice(0, 150)}`;
+              const combinedMemory = currentMemory === "No saved memory yet." || !currentMemory
+                ? newMemoryEntry
+                : `${currentMemory}\n---\n${newMemoryEntry}`.slice(-2000);
+              updateUserSettings(user.id, { memory: combinedMemory });
+            }
+          } catch (dbError) {
+            console.error("[api/chat] Background persistence error:", dbError);
+          }
+        }
+      },
+    });
+
+    const responseStream = aiStream.pipeThrough(transformStream);
+
+    return new Response(responseStream, {
+      headers: {
+        "Content-Type": "text/plain; charset=utf-8",
+        "Cache-Control": "no-cache, no-transform",
+        "X-Accel-Buffering": "no",
+        "X-ZeroGen-Model": modelUsed,
+        "X-ZeroGen-Fallback": String(fallbackUsed),
+      },
+    });
+  } catch (error: unknown) {
+    console.error("[api/chat] Error generating chat response:", error);
+    const friendlyErrorMessage = formatAIError(error);
+    return new Response(
+      JSON.stringify({
+        error: friendlyErrorMessage,
+        reply: `ZeroGen notice: ${friendlyErrorMessage}`,
+      }),
+      {
+        status: 500,
+        headers: { "Content-Type": "application/json" },
+      }
     );
   }
 }
